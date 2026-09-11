@@ -959,9 +959,21 @@ def _style_sheet(ws, df: pd.DataFrame):
                 cell.number_format = "0.00"
 
     for col_idx, col_name in enumerate(df.columns, start=1):
+        # NOTE: this used to be `df[col_name].astype(str).map(len).max()`.
+        # On newer pandas (the "str" dtype backend, e.g. pandas >= 3.0),
+        # `.astype(str)` on a numeric column no longer stringifies missing
+        # values into the text "nan" the way it does on classic object
+        # dtype — it leaves each NaN cell as an actual float NaN. `.map(len)`
+        # then crashes with "object of type 'float' has no len()" the first
+        # time it hits one of those leftover NaNs (e.g. an unmatched
+        # purchase/sale, a brand_group with no brand_group_meta row, an
+        # all-blank Off Invoice Margin column, etc — all normal, expected
+        # cases in this data). Handling missing values explicitly instead
+        # of relying on astype(str) to do it works the same on every
+        # pandas version.
         max_len = max(
             len(str(col_name)),
-            df[col_name].astype(str).map(len).max() if len(df) else 0,
+            df[col_name].map(lambda v: len(str(v)) if pd.notna(v) else 0).max() if len(df) else 0,
         )
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 40)
 
