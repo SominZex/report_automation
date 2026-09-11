@@ -227,70 +227,81 @@ def _to_native_margin(value):
         return None
 
 
-def save_brand_group_meta(edited_df: pd.DataFrame) -> dict:
-    """Upserts every row in the editor grid into brand_group_meta.
+def _row_params(row: dict) -> dict:
+    """Normalize one editor-grid row (dict keyed by the display column
+    names) into the DB-ready param dict, via the _to_native_* coercions."""
+    return {
+        "start_date": _to_native_date(row.get("Start Date")),
+        "legal_name": _to_native_text(row.get("Legal Name")),
+        "tot_validity": _to_native_text(row.get("TOT Validity")),
+        "off_invoice_margin_pct": _to_native_margin(row.get("Off Invoice Margin (%)")),
+    }
 
-    Each row is saved in its OWN transaction rather than one big
-    transaction for the whole grid. Postgres aborts an entire transaction
-    the moment any statement inside it errors (e.g. a margin value that
-    doesn't fit the column's precision) — with everything in one
-    transaction, that meant one bad cell silently discarded every other
-    valid edit on the page too. Saving row-by-row means a problem row is
-    reported clearly and skipped, while every other edited row still saves.
 
-    Returns {"saved": [brand_group, ...], "failed": [(brand_group, error), ...]}.
+def save_brand_group_meta(edited_df: pd.DataFrame, original_df: pd.DataFrame) -> dict:
+    """Upserts only the rows that actually changed, using ONE database
+    connection with a per-row SAVEPOINT (not a brand-new connection per
+    row).
+
+    Two things used to make this slow/fragile:
+      1. Every row — even ones you didn't touch — got upserted on every
+         Save, so editing one brand group re-wrote the whole grid.
+      2. Each row opened its own top-level transaction, which (since the
+         engine uses NullPool, i.e. no connection reuse) meant a brand-new
+         DB connection per row, every time.
+    Comparing against `original_df` (the grid's pre-edit state, as loaded
+    from the DB) lets us skip untouched rows entirely, and a SAVEPOINT
+    per changed row still means one bad row rolls back only itself — not
+    the whole grid, and not a fresh connection either.
+
+    Returns {"saved": [...], "failed": [(brand_group, error), ...], "unchanged": int}.
     """
-    rows = edited_df.rename(columns={
-        "Brand Group": "brand_group",
-        "Start Date": "start_date",
-        "Legal Name": "legal_name",
-        "TOT Validity": "tot_validity",
-        "Off Invoice Margin (%)": "off_invoice_margin_pct",
-    }).to_dict(orient="records")
+    original_by_group = {
+        row["Brand Group"]: row for row in original_df.to_dict(orient="records")
+    }
 
-    saved, failed = [], []
+    saved, failed, unchanged = [], [], 0
 
-    for row in rows:
-        brand_group = row.get("brand_group")
-        if not brand_group:
-            continue
+    with report.engine.begin() as conn:
+        for row in edited_df.to_dict(orient="records"):
+            brand_group = row.get("Brand Group")
+            if not brand_group:
+                continue
 
-        params = {
-            "brand_group": brand_group,
-            "start_date": _to_native_date(row.get("start_date")),
-            "legal_name": _to_native_text(row.get("legal_name")),
-            "tot_validity": _to_native_text(row.get("tot_validity")),
-            "off_invoice_margin_pct": _to_native_margin(row.get("off_invoice_margin_pct")),
-        }
+            new_params = _row_params(row)
+            old_params = _row_params(original_by_group.get(brand_group, {}))
+            if new_params == old_params:
+                unchanged += 1
+                continue
 
-        try:
-            with report.engine.begin() as conn:
-                conn.execute(
-                    text("""
-                        INSERT INTO brand_group_meta
-                            ("brand_group", "start_date", "legal_name", "tot_validity", "off_invoice_margin_pct", "updated_at")
-                        VALUES
-                            (:brand_group, :start_date, :legal_name, :tot_validity, :off_invoice_margin_pct, now())
-                        ON CONFLICT ("brand_group") DO UPDATE SET
-                            "start_date" = EXCLUDED."start_date",
-                            "legal_name" = EXCLUDED."legal_name",
-                            "tot_validity" = EXCLUDED."tot_validity",
-                            "off_invoice_margin_pct" = EXCLUDED."off_invoice_margin_pct",
-                            "updated_at" = now()
-                    """),
-                    params,
-                )
-            saved.append(brand_group)
-        except Exception as e:
-            # Keep just the DB's first error line (e.g. "numeric field
-            # overflow") — the full SQLAlchemy traceback isn't useful here.
-            failed.append((brand_group, str(e).splitlines()[0]))
+            try:
+                with conn.begin_nested():  # SAVEPOINT — isolates just this row
+                    conn.execute(
+                        text("""
+                            INSERT INTO brand_group_meta
+                                ("brand_group", "start_date", "legal_name", "tot_validity", "off_invoice_margin_pct", "updated_at")
+                            VALUES
+                                (:brand_group, :start_date, :legal_name, :tot_validity, :off_invoice_margin_pct, now())
+                            ON CONFLICT ("brand_group") DO UPDATE SET
+                                "start_date" = EXCLUDED."start_date",
+                                "legal_name" = EXCLUDED."legal_name",
+                                "tot_validity" = EXCLUDED."tot_validity",
+                                "off_invoice_margin_pct" = EXCLUDED."off_invoice_margin_pct",
+                                "updated_at" = now()
+                        """),
+                        {"brand_group": brand_group, **new_params},
+                    )
+                saved.append(brand_group)
+            except Exception as e:
+                # Keep just the DB's first error line (e.g. "numeric field
+                # overflow") — the full SQLAlchemy traceback isn't useful here.
+                failed.append((brand_group, str(e).splitlines()[0]))
 
     # Metadata changed — drop the cache so the editor reloads fresh values
     # (right after st.rerun() below) instead of what was cached pre-save.
     _cached_brand_group_meta.clear()
 
-    return {"saved": saved, "failed": failed}
+    return {"saved": saved, "failed": failed, "unchanged": unchanged}
 
 
 # =============================================================================
@@ -387,18 +398,23 @@ with tab_meta:
     )
 
     if st.button("Save brand group settings", type="primary"):
-        result = save_brand_group_meta(edited_df)
+        result = save_brand_group_meta(edited_df, editor_df)
         if result["failed"]:
             details = "; ".join(f"**{bg}** — {msg}" for bg, msg in result["failed"])
             st.error(
-                f"Saved {len(result['saved'])} row(s), but {len(result['failed'])} row(s) were "
-                f"rejected by the database and skipped: {details}. "
+                f"Saved {len(result['saved'])} changed row(s), but {len(result['failed'])} row(s) "
+                f"were rejected by the database and skipped: {details}. "
                 f"(If this says 'numeric field overflow' on Off Invoice Margin, the value is too "
                 f"precise or too large for that column — try a smaller/rounder number, or ask to "
                 f"have the column's precision widened.)"
             )
+        elif result["saved"]:
+            st.success(
+                f"Saved {len(result['saved'])} changed row(s) "
+                f"({result['unchanged']} unchanged, skipped)."
+            )
         else:
-            st.success(f"Saved {len(result['saved'])} row(s).")
+            st.info("No changes to save.")
         st.rerun()
 
 
