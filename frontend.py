@@ -175,8 +175,71 @@ def load_brand_group_meta_editor_df(brand_sub_df: pd.DataFrame, meta_df: pd.Data
     return merged
 
 
-def save_brand_group_meta(edited_df: pd.DataFrame) -> None:
-    """Upserts every row in the editor grid into brand_group_meta."""
+def _to_native_date(value):
+    """Normalize a Start Date cell to a plain datetime.date or None.
+    st.data_editor can hand back a datetime.date, a pandas Timestamp, NaT,
+    float NaN, an ISO string, or None depending on whether the cell was
+    actually edited — psycopg2 only knows how to adapt the first and last
+    of those, so everything else needs coercing here."""
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    if value is pd.NaT:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.date()
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            return pd.to_datetime(value).date()
+        except (ValueError, TypeError):
+            return None
+    return value  # already a plain datetime.date
+
+
+def _to_native_text(value):
+    """Normalize a text cell (Legal Name / TOT Validity) to a plain str or
+    None — collapses NaN/NaT/blank-string to None."""
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    text_value = str(value).strip()
+    return text_value or None
+
+
+def _to_native_margin(value):
+    """Normalize the Off Invoice Margin (%) cell to a plain, rounded Python
+    float or None. Rounding to 2dp avoids float drift from the widget
+    (e.g. 12.339999999999998) tripping the DB column's precision, and
+    coercing via float() turns numpy scalar types (which psycopg2 can't
+    adapt on their own) into a native Python float."""
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def save_brand_group_meta(edited_df: pd.DataFrame) -> dict:
+    """Upserts every row in the editor grid into brand_group_meta.
+
+    Each row is saved in its OWN transaction rather than one big
+    transaction for the whole grid. Postgres aborts an entire transaction
+    the moment any statement inside it errors (e.g. a margin value that
+    doesn't fit the column's precision) — with everything in one
+    transaction, that meant one bad cell silently discarded every other
+    valid edit on the page too. Saving row-by-row means a problem row is
+    reported clearly and skipped, while every other edited row still saves.
+
+    Returns {"saved": [brand_group, ...], "failed": [(brand_group, error), ...]}.
+    """
     rows = edited_df.rename(columns={
         "Brand Group": "brand_group",
         "Start Date": "start_date",
@@ -185,35 +248,49 @@ def save_brand_group_meta(edited_df: pd.DataFrame) -> None:
         "Off Invoice Margin (%)": "off_invoice_margin_pct",
     }).to_dict(orient="records")
 
-    with report.engine.begin() as conn:
-        for row in rows:
-            if not row.get("brand_group"):
-                continue
-            conn.execute(
-                text("""
-                    INSERT INTO brand_group_meta
-                        ("brand_group", "start_date", "legal_name", "tot_validity", "off_invoice_margin_pct", "updated_at")
-                    VALUES
-                        (:brand_group, :start_date, :legal_name, :tot_validity, :off_invoice_margin_pct, now())
-                    ON CONFLICT ("brand_group") DO UPDATE SET
-                        "start_date" = EXCLUDED."start_date",
-                        "legal_name" = EXCLUDED."legal_name",
-                        "tot_validity" = EXCLUDED."tot_validity",
-                        "off_invoice_margin_pct" = EXCLUDED."off_invoice_margin_pct",
-                        "updated_at" = now()
-                """),
-                {
-                    "brand_group": row["brand_group"],
-                    "start_date": row.get("start_date") or None,
-                    "legal_name": row.get("legal_name") or None,
-                    "tot_validity": row.get("tot_validity") or None,
-                    "off_invoice_margin_pct": row.get("off_invoice_margin_pct")
-                        if pd.notna(row.get("off_invoice_margin_pct")) else None,
-                },
-            )
+    saved, failed = [], []
+
+    for row in rows:
+        brand_group = row.get("brand_group")
+        if not brand_group:
+            continue
+
+        params = {
+            "brand_group": brand_group,
+            "start_date": _to_native_date(row.get("start_date")),
+            "legal_name": _to_native_text(row.get("legal_name")),
+            "tot_validity": _to_native_text(row.get("tot_validity")),
+            "off_invoice_margin_pct": _to_native_margin(row.get("off_invoice_margin_pct")),
+        }
+
+        try:
+            with report.engine.begin() as conn:
+                conn.execute(
+                    text("""
+                        INSERT INTO brand_group_meta
+                            ("brand_group", "start_date", "legal_name", "tot_validity", "off_invoice_margin_pct", "updated_at")
+                        VALUES
+                            (:brand_group, :start_date, :legal_name, :tot_validity, :off_invoice_margin_pct, now())
+                        ON CONFLICT ("brand_group") DO UPDATE SET
+                            "start_date" = EXCLUDED."start_date",
+                            "legal_name" = EXCLUDED."legal_name",
+                            "tot_validity" = EXCLUDED."tot_validity",
+                            "off_invoice_margin_pct" = EXCLUDED."off_invoice_margin_pct",
+                            "updated_at" = now()
+                    """),
+                    params,
+                )
+            saved.append(brand_group)
+        except Exception as e:
+            # Keep just the DB's first error line (e.g. "numeric field
+            # overflow") — the full SQLAlchemy traceback isn't useful here.
+            failed.append((brand_group, str(e).splitlines()[0]))
+
     # Metadata changed — drop the cache so the editor reloads fresh values
     # (right after st.rerun() below) instead of what was cached pre-save.
     _cached_brand_group_meta.clear()
+
+    return {"saved": saved, "failed": failed}
 
 
 # =============================================================================
@@ -235,7 +312,7 @@ if missing_tables:
 # UI
 # =============================================================================
 
-st.title("purchase-Sale-Stock Report")
+st.title("purchase-Sale_Stock Report")
 
 tab_brands, tab_meta, tab_generate = st.tabs(["Brand Selection", "Brand Group Settings", "Generate & Send Report"])
 
@@ -298,7 +375,7 @@ with tab_meta:
     edited_df = st.data_editor(
         editor_df,
         num_rows="fixed",
-        use_container_width=True,
+        width="stretch",
         column_config={
             "Brand Group": st.column_config.TextColumn(disabled=True),
             "Start Date": st.column_config.DateColumn(),
@@ -310,8 +387,18 @@ with tab_meta:
     )
 
     if st.button("Save brand group settings", type="primary"):
-        save_brand_group_meta(edited_df)
-        st.success("Saved.")
+        result = save_brand_group_meta(edited_df)
+        if result["failed"]:
+            details = "; ".join(f"**{bg}** — {msg}" for bg, msg in result["failed"])
+            st.error(
+                f"Saved {len(result['saved'])} row(s), but {len(result['failed'])} row(s) were "
+                f"rejected by the database and skipped: {details}. "
+                f"(If this says 'numeric field overflow' on Off Invoice Margin, the value is too "
+                f"precise or too large for that column — try a smaller/rounder number, or ask to "
+                f"have the column's precision widened.)"
+            )
+        else:
+            st.success(f"Saved {len(result['saved'])} row(s).")
         st.rerun()
 
 

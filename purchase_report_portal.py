@@ -1075,11 +1075,9 @@ def run_report(start_date: date, end_exclusive: date, end_date_inclusive: date) 
         **delivery_result,
     }
 
-
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
-
 if __name__ == "__main__":
     start_date, end_exclusive, end_date_inclusive = get_last_6_months_window()
     run_report(start_date, end_exclusive, end_date_inclusive)
