@@ -18,6 +18,19 @@ Reuses purchase_sales_stock_report.py directly (same DB engine, same
 run_report() pipeline) so there is exactly one place that knows how to
 build the workbook and send the email — this app only edits settings and
 triggers that same pipeline.
+
+PERFORMANCE NOTE — Streamlit reruns this whole script top-to-bottom on
+every widget interaction (a multiselect change, a data_editor cell edit,
+even a tab switch). The DB reads used to build the "Brand Selection" and
+"Brand Group Settings" tabs (get_brand_sub_mapping, get_brand_group_meta,
+get_selected_brands) are therefore cached below with @st.cache_data, and
+fetched exactly once per rerun and passed into the functions that need
+them — previously several helper functions each queried the same table
+independently, so a single click could trigger 5-6 redundant DB round
+trips. Each cached function is explicitly cleared right after its matching
+save action so the UI never shows stale data post-save. The brand
+selection form is also wrapped in st.form so adding/removing a brand
+doesn't trigger a full app rerun until you actually hit Save.
 ────────────────────────────────────────────────────────────────────────────
 """
 
@@ -33,10 +46,16 @@ st.set_page_config(page_title="Purchase-Sale-Stock Report", layout="wide")
 
 
 # =============================================================================
-# DB helpers (all against the same engine purchase_sales_stock_report.py uses)
+# Cached DB reads
 # =============================================================================
+# TTL is a safety net (in case a save's cache-clear is ever missed); the
+# real freshness guarantee comes from explicitly clearing these right after
+# each save, below.
+CACHE_TTL_SECONDS = 60
 
-def _table_exists(table_name: str) -> bool:
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_table_check(table_name: str) -> bool:
     try:
         report.safe_read_sql(f'SELECT 1 FROM "{table_name}" LIMIT 1')
         return True
@@ -44,8 +63,31 @@ def _table_exists(table_name: str) -> bool:
         return False
 
 
-def load_selected_brands() -> list[str]:
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_selected_brands() -> list[str]:
     return report.get_selected_brands()
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_brand_sub_mapping() -> pd.DataFrame:
+    return report.get_brand_sub_mapping()
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_brand_group_meta() -> pd.DataFrame:
+    return report.get_brand_group_meta()
+
+
+def _table_exists(table_name: str) -> bool:
+    return _cached_table_check(table_name)
+
+
+# =============================================================================
+# DB helpers (all against the same engine purchase_sales_stock_report.py uses)
+# =============================================================================
+
+def load_selected_brands() -> list[str]:
+    return _cached_selected_brands()
 
 
 def save_selected_brands(brands: list[str]) -> None:
@@ -61,44 +103,48 @@ def save_selected_brands(brands: list[str]) -> None:
                 ),
                 [{"brand_name": b} for b in brands],
             )
+    # The saved list changed — drop the cache so the next read (right after
+    # st.rerun() below) picks up the new selection instead of a stale one.
+    _cached_selected_brands.clear()
 
 
-def load_all_known_brands() -> list[str]:
+def load_all_known_brands(brand_sub_df: pd.DataFrame, current_selection: list[str]) -> list[str]:
     """All brand names available to add — union of brand_sub.sub_brand and
-    the current selection, so you can add brands not yet in brand_sub too."""
+    the current selection, so you can add brands not yet in brand_sub too.
+
+    Takes the already-fetched brand_sub_df / current_selection rather than
+    querying them itself, so building this list costs no extra DB round trip."""
     try:
-        brand_sub_df = report.get_brand_sub_mapping()
         known = set(brand_sub_df["sub_brand"].dropna().tolist())
     except Exception:
         known = set()
     known |= set(report.BRANDS)
-    known |= set(load_selected_brands())
+    known |= set(current_selection)
     return sorted(known)
 
 
-def load_all_brand_groups() -> list[str]:
+def load_all_brand_groups(brand_sub_df: pd.DataFrame, meta_df: pd.DataFrame) -> list[str]:
     """All brand_group values currently reachable from brand_sub, so the
     metadata editor has something to show even before every group has a
-    brand_group_meta row yet."""
+    brand_group_meta row yet.
+
+    Takes the already-fetched frames rather than querying them itself."""
     try:
-        brand_sub_df = report.get_brand_sub_mapping()
         groups = set(brand_sub_df["brand_group"].dropna().tolist())
     except Exception:
         groups = set()
     try:
-        meta_df = report.get_brand_group_meta()
         groups |= set(meta_df["brand_group"].dropna().tolist())
     except Exception:
         pass
     return sorted(groups)
 
 
-def load_brand_group_meta_editor_df() -> pd.DataFrame:
+def load_brand_group_meta_editor_df(brand_sub_df: pd.DataFrame, meta_df: pd.DataFrame) -> pd.DataFrame:
     """Full editor grid: every known brand_group, left-joined with whatever
     metadata already exists, so unconfigured groups show up with blank
     editable cells rather than being absent from the editor."""
-    all_groups = load_all_brand_groups()
-    meta_df = report.get_brand_group_meta()
+    all_groups = load_all_brand_groups(brand_sub_df, meta_df)
 
     base = pd.DataFrame({"brand_group": all_groups})
     merged = base.merge(meta_df, on="brand_group", how="left")
@@ -165,6 +211,9 @@ def save_brand_group_meta(edited_df: pd.DataFrame) -> None:
                         if pd.notna(row.get("off_invoice_margin_pct")) else None,
                 },
             )
+    # Metadata changed — drop the cache so the editor reloads fresh values
+    # (right after st.rerun() below) instead of what was cached pre-save.
+    _cached_brand_group_meta.clear()
 
 
 # =============================================================================
@@ -186,9 +235,15 @@ if missing_tables:
 # UI
 # =============================================================================
 
-st.title("Brand Group Portal")
+st.title("purchase-Sale_Stock Report")
 
 tab_brands, tab_meta, tab_generate = st.tabs(["Brand Selection", "Brand Group Settings", "Generate & Send Report"])
+
+# Fetched once per rerun (cached — see top of file) and shared by both
+# Tab 1 and Tab 2 below, instead of each tab independently re-querying
+# the same tables.
+brand_sub_df = _cached_brand_sub_mapping()
+brand_group_meta_df = _cached_brand_group_meta()
 
 
 # ── Tab 1: Brand Selection ───────────────────────────────────────────────
@@ -199,21 +254,27 @@ with tab_brands:
         "and Brand Group sheets)."
     )
 
-    all_known = load_all_known_brands()
     current_selection = load_selected_brands()
+    all_known = load_all_known_brands(brand_sub_df, current_selection)
 
-    selected = st.multiselect(
-        "Brands included in the report",
-        options=all_known,
-        default=[b for b in current_selection if b in all_known],
-    )
+    # Wrapped in a form: picking/removing brands no longer triggers a full
+    # app rerun (and DB round trip) on every single click — only "Save
+    # brand selection" does.
+    with st.form("brand_selection_form"):
+        selected = st.multiselect(
+            "Brands included in the report",
+            options=all_known,
+            default=[b for b in current_selection if b in all_known],
+        )
 
-    extra = st.text_input(
-        "Add a brand not in the list above (exact spelling as it appears in billing_data/grn_data)",
-        value="",
-    )
+        extra = st.text_input(
+            "Add a brand not in the list above (exact spelling as it appears in billing_data/grn_data)",
+            value="",
+        )
 
-    if st.button("Save brand selection", type="primary"):
+        submitted = st.form_submit_button("Save brand selection", type="primary")
+
+    if submitted:
         final_list = list(dict.fromkeys(selected + ([extra.strip()] if extra.strip() else [])))
         if not final_list:
             st.warning("Selection can't be empty — nothing saved.")
@@ -232,7 +293,7 @@ with tab_meta:
         "MAX(Purchase Amount, Sale Revenue) × Off Invoice Margin (%)."
     )
 
-    editor_df = load_brand_group_meta_editor_df()
+    editor_df = load_brand_group_meta_editor_df(brand_sub_df, brand_group_meta_df)
 
     edited_df = st.data_editor(
         editor_df,
