@@ -107,9 +107,20 @@ def load_brand_group_meta_editor_df() -> pd.DataFrame:
         merged["start_date"] = pd.to_datetime(merged["start_date"], errors="coerce").dt.date
     else:
         merged["start_date"] = None
+
+    # Text columns: a brand_group with no brand_group_meta row comes out of
+    # the left join with NaN (a float) in these cells, not None — whether
+    # or not the column existed before the merge. st.column_config.TextColumn
+    # calls len() on cell values when rendering/validating, so a leftover
+    # NaN float crashes the editor ("object of type 'float' has no len()").
+    # Normalize every NaN to a real None, for both the "column already
+    # existed" and "column was missing" cases.
     for col in ["legal_name", "tot_validity"]:
         if col not in merged.columns:
             merged[col] = None
+        else:
+            merged[col] = merged[col].astype(object).where(merged[col].notna(), None)
+
     if "off_invoice_margin_pct" not in merged.columns:
         merged["off_invoice_margin_pct"] = None
 
