@@ -2,9 +2,10 @@
 purchase_sales_stock_report.py — Purchase/Sales/Stock Report by Product & Brand Group
 ────────────────────────────────────────────────────────────────────────────
 Runs two queries over a DYNAMIC rolling 6-COMPLETE-MONTH window, merges in
-current stock (from `store_product_snapshot`, a Postgres table this script
-populates itself), and builds a single .xlsx **in memory** (never written to
-disk) with three sheets:
+current stock (READ ONLY from `store_product_snapshot`, a Postgres table
+populated separately by stock_snapshot_downloader.py — see below), and
+builds a single .xlsx **in memory** (never written to disk) with three
+sheets:
 
   1. "Product Wise"            — purchase vs sales vs stock, per (brand,
                                   barcode), FULL OUTER JOIN. Includes a
@@ -28,25 +29,26 @@ disk) with three sheets:
                                   Current Stock Amt (₹), Gross Margin on
                                   Sales (%).
 
-STOCK DOWNLOAD — integrated directly into this script (from
-current_stock_downloader.py), so running this ONE script does the whole
-pipeline: download the current stock snapshot for every store in the
-`store_contacts` table, THEN generate the report from it. No separate
-scheduled job is needed to run the downloader first. If some individual
-stores fail to download but at least one store's data was captured, the
-report proceeds anyway (with a warning); only a total failure (nothing
-fetched at all) aborts the run.
+STOCK DOWNLOAD — split OUT of this script on purpose, into a separate
+stock_snapshot_downloader.py meant to be scheduled once a day via cron
+(independently of this report/portal). That script downloads the current
+stock snapshot for every store in `store_contacts` and reloads it into
+`store_product_snapshot` (TRUNCATE + insert). This script only ever READS
+that table (see load_stock() below) — it never calls the stock API and
+never writes to store_product_snapshot itself, so opening the Streamlit
+portal's "Generate & Send Report" tab doesn't have to wait on a store-by-
+store API download every time.
 
-STORE LIST & STOCK STORAGE — both now live in Postgres instead of CSV files:
-  - Store list: `store_contacts` (distinct values of the "store" column),
-    replacing the old partner.csv.
+STORE LIST & STOCK STORAGE — both live in Postgres instead of CSV files:
+  - Store list: `store_contacts` (used only by stock_snapshot_downloader.py
+    now), replacing the old partner.csv.
   - Stock snapshot: `store_product_snapshot`, replacing the old
-    stock_combined/all_stores_stock.csv. This table is TRUNCATED and then
-    reloaded on every run — it always holds exactly the latest snapshot,
-    nothing historical. Note: the table's columns were created unquoted, so
-    Postgres folded them to lowercase (e.g. `productId` -> `productid`) —
-    this script reads/writes using those lowercase names and immediately
-    renames back to the camelCase names the rest of the pipeline expects.
+    stock_combined/all_stores_stock.csv. Reloaded daily by
+    stock_snapshot_downloader.py — always holds exactly that script's last
+    run, nothing historical. Note: the table's columns were created
+    unquoted, so Postgres folded them to lowercase (e.g. `productId` ->
+    `productid`) — load_stock() reads those lowercase names and renames
+    them back to the camelCase names the rest of this pipeline expects.
 
 DATE WINDOW — always 6 full calendar months, excluding whatever month the
 script is run in, regardless of which day of the current month it runs on:
@@ -83,10 +85,8 @@ load_dotenv()
 import io
 import os
 import time
-import base64
 import smtplib
 import logging
-from io import StringIO
 from datetime import date, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -157,13 +157,9 @@ engine = create_engine(
     },
 )
 
-# ── Stock downloader config (integrated from current_stock_downloader.py,
-# so this script can run standalone: download stock -> generate report,
-# with no separate scheduled job needed to run first).
-STOCK_API_LOGIN_URL = _config("STOCK_API_LOGIN_URL", "https://api.thenewshop.in/login")
-STOCK_API_STOCK_URL = _config("STOCK_API_STOCK_URL", "https://api.thenewshop.in/store-stocks/report/storeStocksCSV")
-STOCK_API_USERNAME  = require_config("STOCK_API_USERNAME")
-STOCK_API_PASSWORD  = require_config("STOCK_API_PASSWORD")
+# NOTE: stock-API config (STOCK_API_LOGIN_URL / STOCK_API_USERNAME / etc.)
+# lives in stock_snapshot_downloader.py now, not here — this script never
+# calls the stock API directly, it only reads store_product_snapshot.
 
 # ── Zoho WorkDrive config (cloud upload + public link) — same pattern as
 # monday_previous_month_reports.py. Used automatically whenever the finished
@@ -478,203 +474,12 @@ def get_brand_group_meta() -> pd.DataFrame:
 
 
 # =============================================================================
-# Store list — now driven by store_contacts (replaces partner.csv)
+# Stock — read the snapshot from store_product_snapshot (READ ONLY here)
 # =============================================================================
+# The download/truncate/reload side of this table now lives entirely in
+# stock_snapshot_downloader.py (scheduled daily via cron) — this script
+# only ever reads it.
 
-def get_store_ids() -> list[int]:
-    """Distinct store IDs to download stock for, from store_contacts.store.
-    Non-numeric/blank values are dropped rather than raising, since the
-    table may accumulate stray rows over time."""
-    df = safe_read_sql('SELECT DISTINCT "store" FROM store_contacts WHERE "store" IS NOT NULL')
-    store_ids = pd.to_numeric(df["store"], errors="coerce").dropna().astype(int).tolist()
-    store_ids = sorted(set(store_ids))
-    if not store_ids:
-        raise RuntimeError("No store IDs found in store_contacts — nothing to download stock for.")
-    return store_ids
-
-
-# =============================================================================
-# Stock Download — integrated from current_stock_downloader.py
-# =============================================================================
-# Same login -> per-store fetch -> combine logic as the standalone
-# downloader script, folded in here so running THIS script does the whole
-# pipeline (download stock, then generate the report) without needing a
-# separate scheduled job to run current_stock_downloader.py first. The
-# combined result is written to store_product_snapshot (truncate + reload)
-# instead of a CSV file.
-
-def _stock_api_login() -> str:
-    log.info("Logging in to stock API...")
-    try:
-        r = requests.post(
-            STOCK_API_LOGIN_URL,
-            json={"username": STOCK_API_USERNAME, "password": STOCK_API_PASSWORD},
-            timeout=30,
-        )
-        r.raise_for_status()
-        data = r.json()
-    except requests.RequestException as e:
-        raise RuntimeError(f"Stock API login request failed: {e}")
-    except ValueError:
-        raise RuntimeError(f"Stock API login returned non-JSON response: {r.text}")
-
-    token = data.get("token")
-    if not token:
-        raise RuntimeError(f"Stock API login succeeded but no token returned: {data}")
-
-    log.info("Stock API login successful.")
-    return token
-
-
-def _fetch_store_stock(token: str, store_id: int, run_date: str) -> pd.DataFrame:
-    headers = {"Authorization": token, "accept": "*/*"}
-
-    try:
-        r = requests.get(STOCK_API_STOCK_URL, headers=headers, params={"store": store_id}, timeout=60)
-    except requests.RequestException as e:
-        raise RuntimeError(f"Request failed: {e}")
-
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-
-    if not r.text.strip():
-        raise RuntimeError("Empty response body")
-
-    try:
-        decoded = base64.b64decode(r.text)
-    except Exception as e:
-        raise RuntimeError(f"Base64 decode failed: {e}")
-
-    if len(decoded) < 100:
-        raise RuntimeError(f"Decoded payload too small ({len(decoded)} bytes) — likely invalid data")
-
-    try:
-        df = pd.read_csv(StringIO(decoded.decode("utf-8")))
-    except Exception as e:
-        raise RuntimeError(f"CSV parse failed: {e}")
-
-    if df.empty:
-        raise RuntimeError("Parsed CSV has no rows")
-
-    df.insert(0, "store_id", store_id)
-    df["snapshot_date"] = run_date
-
-    log.info(f"  Store {store_id} -> {len(df)} rows fetched")
-    return df
-
-
-# Target columns of store_product_snapshot, exactly as Postgres folded them
-# (the table was created with unquoted identifiers, so mixed-case names like
-# `productId` became `productid`). Used only for the DB write — see
-# save_stock_snapshot() and its rename-back in load_stock().
-_SNAPSHOT_TABLE_COLUMNS = [
-    "store_id", "productid", "productname", "barcode", "quantity",
-    "sellingprice", "printedmrp", "costprice", "totalamount",
-    "storename", "vendorname", "categoryname", "subcategoryof",
-    "brand", "snapshot_date",
-]
-
-
-def save_stock_snapshot(combined: pd.DataFrame, run_date: str) -> int:
-    """Truncates store_product_snapshot and reloads it with `combined` —
-    the table always holds exactly the latest snapshot. Source column names
-    are matched case-insensitively against the API's CSV headers, so this
-    doesn't break if the API's exact casing shifts slightly. Returns the
-    number of rows written."""
-    lower_lookup = {c.lower(): c for c in combined.columns}
-
-    out = pd.DataFrame()
-    missing = []
-    for target_col in _SNAPSHOT_TABLE_COLUMNS:
-        source_col = lower_lookup.get(target_col)
-        if source_col is None:
-            missing.append(target_col)
-            out[target_col] = pd.NA
-        else:
-            out[target_col] = combined[source_col]
-
-    if missing:
-        log.warning(
-            f"Stock download is missing expected column(s) {missing} — those "
-            f"columns will be NULL in store_product_snapshot."
-        )
-
-    out["store_id"] = pd.to_numeric(out["store_id"], errors="coerce")
-    out["barcode"] = out["barcode"].astype(str).str.strip()
-    out["brand"] = out["brand"].astype(str).str.strip()
-    out["snapshot_date"] = pd.to_datetime(run_date).date()
-
-    with engine.begin() as conn:
-        conn.execute(text("TRUNCATE TABLE store_product_snapshot"))
-        out.to_sql(
-            "store_product_snapshot",
-            conn,
-            if_exists="append",
-            index=False,
-            method="multi",
-            chunksize=1000,
-        )
-
-    log.info(f"store_product_snapshot truncated and reloaded with {len(out)} rows.")
-    return len(out)
-
-
-def stock_snapshot_row_count() -> int:
-    try:
-        df = safe_read_sql("SELECT COUNT(*) AS n FROM store_product_snapshot")
-        return int(df["n"].iloc[0])
-    except Exception:
-        return 0
-
-
-def download_current_stock(run_date: str | None = None) -> None:
-    """
-    Downloads the current stock snapshot for every store in store_contacts
-    and writes the combined result into store_product_snapshot (truncate +
-    reload — see save_stock_snapshot()).
-
-    Same behavior as the original standalone current_stock_downloader.py:
-    still RAISES at the end if ANY individual store failed to download —
-    even though the snapshot table was already reloaded successfully with
-    whatever stores DID succeed. The caller decides whether that's fatal
-    (see the try/except around this call in run_report() below).
-    """
-    run_date = run_date or date.today().isoformat()
-    log.info(f"Stock snapshot date: {run_date}")
-
-    store_ids = get_store_ids()
-    log.info(f"Loaded {len(store_ids)} stores from store_contacts")
-
-    token = _stock_api_login()
-
-    all_dfs = []
-    failed = []
-
-    for store_id in store_ids:
-        try:
-            df = _fetch_store_stock(token, store_id, run_date)
-            all_dfs.append(df)
-        except RuntimeError as e:
-            log.error(f"Store {store_id} failed: {e}")
-            failed.append(store_id)
-
-    if not all_dfs:
-        raise RuntimeError("No store data fetched — aborting, store_product_snapshot left unchanged")
-
-    combined = pd.concat(all_dfs, ignore_index=True)
-    log.info(f"Combined {len(combined)} rows across {len(all_dfs)} stores")
-
-    save_stock_snapshot(combined, run_date)
-
-    if failed:
-        raise RuntimeError(f"Stock download completed with failures for stores: {failed}")
-
-    log.info("Stock snapshot download completed successfully.")
-
-
-# =============================================================================
-# Stock — read the snapshot back from store_product_snapshot
-# =============================================================================
 
 def load_stock() -> pd.DataFrame:
     """
@@ -1217,20 +1022,8 @@ def run_report(start_date: date, end_exclusive: date, end_date_inclusive: date) 
     brand_group_df = get_brand_group_summary(start_date, end_exclusive, selected_brands)
     log.info(f"  {len(brand_group_df)} brand-group rows")
 
-    log.info("Downloading current stock snapshot for all stores (store_contacts -> store_product_snapshot)...")
-    try:
-        download_current_stock()
-    except RuntimeError as e:
-        if stock_snapshot_row_count() > 0:
-            log.warning(
-                f"Stock download had per-store failures, but store_product_snapshot was "
-                f"still reloaded with the stores that succeeded — continuing: {e}"
-            )
-        else:
-            log.error(f"Stock download failed and store_product_snapshot is empty: {e}")
-            raise
-
-    log.info("Loading stock snapshot from store_product_snapshot ...")
+    log.info("Loading current stock snapshot from store_product_snapshot "
+             "(populated separately by the daily stock_snapshot_downloader.py cron job)...")
     stock_df = load_stock()
     stock_by_barcode = aggregate_stock_by_barcode(stock_df)
     stock_by_brand_group = aggregate_stock_by_brand_group(stock_df, brand_sub_df)
