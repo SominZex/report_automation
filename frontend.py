@@ -29,7 +29,7 @@ from sqlalchemy import text
 
 import purchase_report_portal as report
 
-st.set_page_config(page_title="Brand Group Portal", layout="wide")
+st.set_page_config(page_title="Purchase-Sale-Stock Report", layout="wide")
 
 
 # =============================================================================
