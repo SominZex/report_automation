@@ -235,7 +235,7 @@ if missing_tables:
 # UI
 # =============================================================================
 
-st.title("purchase-Sale_Stock Report")
+st.title("purchase-Sale-Stock Report")
 
 tab_brands, tab_meta, tab_generate = st.tabs(["Brand Selection", "Brand Group Settings", "Generate & Send Report"])
 
