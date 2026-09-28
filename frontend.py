@@ -6,7 +6,9 @@ Lets you:
   2. Edit per-brand-group metadata — Start Date, Legal Name, TOT Validity,
      Off Invoice Margin (%) — stored in brand_group_meta.
   3. Pick a date range and generate + email the report right away, using
-     whatever brand list / metadata is currently saved.
+     whatever brand list / metadata is currently saved. The report has four
+     sheets (Product Wise, Brand Group, Mondelez Product Wise, Vendor
+     Monthly); all four follow the brand list and the date range picked here.
 
 Run with:  streamlit run brand_portal_app.py
 
@@ -40,7 +42,13 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import text
 
-import purchase_report_portal as report
+# The report module is normally purchase_sales_stock_report.py; the original
+# import name (purchase_report_portal) is kept as a fallback so this works
+# whichever way the file is saved on your server.
+try:
+    import purchase_sales_stock_report as report
+except ImportError:
+    import purchase_report_portal as report
 
 st.set_page_config(page_title="Purchase-Sale-Stock Report", layout="wide")
 
@@ -338,8 +346,8 @@ brand_group_meta_df = _cached_brand_group_meta()
 with tab_brands:
     st.subheader("Selected brands")
     st.caption(
-        "Only brands selected here are included in the report (both the Product Wise "
-        "and Brand Group sheets)."
+        "Only brands selected here are included in the report (all sheets: Product Wise, "
+        "Brand Group, Mondelez Product Wise and Vendor Monthly)."
     )
 
     current_selection = load_selected_brands()
@@ -435,7 +443,8 @@ with tab_generate:
     else:
         st.caption(
             f"This will run the report for **{picked_start:%d %b %Y} to {picked_end:%d %b %Y}** "
-            f"using the brand list and brand-group settings saved in the other two tabs, "
+            f"using the brand list and brand-group settings saved in the other two tabs "
+            f"(all four sheets, including Vendor Monthly, use this same date range and brand list), "
             f"then email it via the same delivery logic as the scheduled report."
         )
 
@@ -450,7 +459,8 @@ with tab_generate:
                         f"emailed via {result['delivery'].replace('_', ' ')} — "
                         f"Product Wise: {rows['product_wise']} rows, "
                         f"Brand Group: {rows['brand_group']} rows, "
-                        f"Mondelez Product Wise: {rows['mondelez_product_wise']} rows. "
+                        f"Mondelez Product Wise: {rows['mondelez_product_wise']} rows, "
+                        f"Vendor Monthly: {rows['vendor_monthly']} rows. "
                         f"The workbook was not saved to disk."
                     )
                 except Exception as e:
