@@ -1,10 +1,11 @@
 """
 purchase_sales_stock_report.py — Purchase/Sales/Stock Report by Product & Brand Group
 ────────────────────────────────────────────────────────────────────────────
-Runs two queries over a DYNAMIC rolling 6-COMPLETE-MONTH window, merges in
-current stock (READ ONLY from `store_product_snapshot`, a Postgres table
-populated separately by stock_snapshot_downloader.py — see below), and
-builds a single .xlsx **in memory** (never written to disk) with three
+Runs several queries over a DYNAMIC date window (default: rolling 6
+COMPLETE months; the Streamlit portal can pass any user-picked window),
+merges in current stock (READ ONLY from `store_product_snapshot`, a Postgres
+table populated separately by stock_snapshot_downloader.py — see below), and
+builds a single .xlsx **in memory** (never written to disk) with four
 sheets:
 
   1. "Product Wise"            — purchase vs sales vs stock, per (brand,
@@ -28,6 +29,28 @@ sheets:
                                   Sale Revenue (₹, Ex-GST), Current Stock Qty,
                                   Current Stock Amt (₹), Gross Margin on
                                   Sales (%).
+  4. "Vendor Monthly"           — purchase vs sales vs stock per (brand_group,
+                                  sub_brand, vendor, vendorGst, month),
+                                  columns: Brand(Group), Sub Brand, Vendor,
+                                  Vendor GST, Month, Purchase Qty, Purchase
+                                  Amount (₹), Sale Qty, Sale Revenue (₹),
+                                  Stock Qty, Stock Amount (₹), Margin%.
+                                  Uses the SAME date window and the SAME
+                                  selected-brand list as sheets 1-3, so it
+                                  follows the portal's date picker and Brand
+                                  Selection tab automatically.
+                                  ⚠ Purchase Qty/Amount are genuinely
+                                  vendor-specific (grouped straight off
+                                  grn_data). Sale/Stock are NOT — billing_data
+                                  has no vendor column, so a sub_brand's whole
+                                  sale/stock total for that month is repeated
+                                  on every vendor row for that sub_brand+month.
+                                  Safe to read row-by-row; do not sum Sale/Stock
+                                  down the Vendor column for a multi-vendor
+                                  sub_brand+month, or you'll double-count.
+                                  Margin% is still meaningful per row (that
+                                  vendor's own average cost vs the month's
+                                  realized average sale price).
 
 STOCK DOWNLOAD — split OUT of this script on purpose, into a separate
 stock_snapshot_downloader.py meant to be scheduled once a day via cron
@@ -50,13 +73,19 @@ STORE LIST & STOCK STORAGE — both live in Postgres instead of CSV files:
     `productid`) — load_stock() reads those lowercase names and renames
     them back to the camelCase names the rest of this pipeline expects.
 
-DATE WINDOW — always 6 full calendar months, excluding whatever month the
-script is run in, regardless of which day of the current month it runs on:
+DATE WINDOW — by default always 6 full calendar months, excluding whatever
+month the script is run in, regardless of which day of the current month it
+runs on:
 
     Run date        -> Window used
     2026-09-07       -> 2026-03-01 to 2026-08-31  (Mar, Apr, May, Jun, Jul, Aug)
     2026-09-28       -> 2026-03-01 to 2026-08-31  (same — day-of-month doesn't matter)
     2026-01-15       -> 2025-07-01 to 2025-12-31  (year boundary handled)
+
+The Streamlit portal can pass any start/end instead; every sheet (including
+Vendor Monthly) uses whatever window run_report() is given. If the window
+starts/ends mid-month, the first/last month on the Vendor Monthly sheet
+only contains the days inside the window.
 
 STOCK HANDLING:
   - Stock is a CURRENT-DAY snapshot only — it has no historical month
@@ -65,6 +94,9 @@ STOCK HANDLING:
   - Product-wise sheets: stock is summed network-wide (across all stores)
     per (brand, barcode) and merged onto the matching product row.
   - Brand-group sheet: stock is summed network-wide per brand_group.
+  - Vendor Monthly sheet: stock is summed network-wide per brandName
+    (sub_brand) and repeated across every vendor+month row for that
+    sub_brand — see the caveat under sheet 4 above.
 
 DELIVERY — the finished workbook is never saved to local disk. It's built
 into an in-memory buffer and either attached directly to the report email
@@ -76,6 +108,11 @@ read via _config(), which checks Streamlit's secrets manager first (when
 running inside the Streamlit portal) and falls back to environment
 variables / .env (for the standalone script / Airflow DAG). See
 secrets.toml.example for the expected keys.
+
+SCHEMA ASSUMPTION (Vendor Monthly sheet only) — grn_data has "vendor" and
+"vendorGst" columns directly (same camelCase convention as "brandName",
+"recievedQuantity"). If your actual column names differ, update
+VENDOR_MONTHLY_QUERY below.
 ────────────────────────────────────────────────────────────────────────────
 """
 
@@ -113,7 +150,7 @@ log = logging.getLogger(__name__)
 # CONFIG — Streamlit secrets first, then environment variables (.env)
 # =============================================================================
 # Works in both contexts this module runs in:
-#   - the Streamlit portal (brand_date_portal.py), which can populate
+#   - the Streamlit portal (brand_portal_app.py), which can populate
 #     .streamlit/secrets.toml — see secrets.toml.example
 #   - the standalone script / Airflow DAG, which has no Streamlit runtime
 #     and relies on a .env file / real environment variables instead.
@@ -448,6 +485,84 @@ def get_brand_sub_mapping() -> pd.DataFrame:
 
 
 # =============================================================================
+# Query 3 — Vendor Monthly (vendor+month grain on purchase, sub_brand+month
+# grain on sales — billing_data has no vendor column)
+# =============================================================================
+# Uses the same %(start)s / %(end_exclusive)s / %(brands)s params as the
+# other queries, so it follows the portal's date picker and brand selection.
+#
+# ⚠ Purchase Qty/Amount are genuinely vendor-specific. Sale Qty/Revenue are
+# NOT — billing_data has no vendor column, so each brandName+month's whole
+# sale total is broadcast onto every vendor row for that brandName+month via
+# the join below. See the module docstring (sheet 4).
+#
+# Rows with sales but no GRN in that month come through with a blank vendor /
+# vendorGst (FULL OUTER JOIN), and rows with purchases but no sales show
+# Sale Qty/Revenue = 0 and a blank Margin%.
+
+VENDOR_MONTHLY_QUERY = """
+WITH purchase AS (
+    SELECT
+        "brandName",
+        "vendor",
+        "vendorGst",
+        TO_CHAR(DATE_TRUNC('month', "Date"), 'YYYY-MM') AS "month",
+        SUM("recievedQuantity") AS purchase_qty,
+        SUM("totalCost") AS purchase_amount
+    FROM grn_data
+    WHERE "brandName" = ANY(%(brands)s)
+      AND "Date" >= %(start)s
+      AND "Date" < %(end_exclusive)s
+    GROUP BY "brandName", "vendor", "vendorGst",
+             TO_CHAR(DATE_TRUNC('month', "Date"), 'YYYY-MM')
+),
+sales AS (
+    SELECT
+        "brandName",
+        TO_CHAR(DATE_TRUNC('month', "orderDate"), 'YYYY-MM') AS "month",
+        SUM("quantity") AS sale_qty,
+        SUM("orderAmountNet") AS sale_revenue
+    FROM billing_data
+    WHERE "brandName" = ANY(%(brands)s)
+      AND "orderDate" >= %(start)s
+      AND "orderDate" < %(end_exclusive)s
+      AND "orderStatus" NOT IN ('CANCELLED', 'CANCELED')
+    GROUP BY "brandName", TO_CHAR(DATE_TRUNC('month', "orderDate"), 'YYYY-MM')
+)
+SELECT
+    COALESCE(p."brandName", s."brandName") AS "brandName",
+    p."vendor" AS "vendor",
+    p."vendorGst" AS "vendorGst",
+    COALESCE(p."month", s."month") AS "month",
+    COALESCE(p.purchase_qty, 0) AS "purchase_qty",
+    ROUND(COALESCE(p.purchase_amount, 0), 2) AS "purchase_amount",
+    COALESCE(s.sale_qty, 0) AS "sale_qty",
+    ROUND(COALESCE(s.sale_revenue, 0), 2) AS "sale_revenue",
+    ROUND(
+        (
+            (s.sale_revenue / NULLIF(s.sale_qty, 0))
+            - (p.purchase_amount / NULLIF(p.purchase_qty, 0))
+        )
+        / NULLIF(s.sale_revenue / NULLIF(s.sale_qty, 0), 0)
+        * 100,
+        2
+    ) AS "margin_pct"
+FROM purchase p
+FULL OUTER JOIN sales s
+    ON p."brandName" = s."brandName"
+   AND p."month" = s."month"
+ORDER BY "brandName", "month", "vendor"
+"""
+
+
+def get_vendor_monthly(start_date: date, end_exclusive: date, brands: list[str]) -> pd.DataFrame:
+    return safe_read_sql(
+        VENDOR_MONTHLY_QUERY,
+        params={"start": start_date, "end_exclusive": end_exclusive, "brands": brands},
+    )
+
+
+# =============================================================================
 # brand_group_meta — the portal-editable Start Date / Legal Name / TOT
 # Validity / Off Invoice Margin (%), keyed to brand_sub.brand_group
 # =============================================================================
@@ -488,9 +603,9 @@ def load_stock() -> pd.DataFrame:
     (brand, barcode, quantity, totalAmount, etc).
 
     NOTE: this is whatever day the downloader last ran, not tied to the
-    6-month sales/purchase window — there's no historical stock to pull
-    for past months (same limitation as the existing monthly report's
-    stock handling).
+    sales/purchase window — there's no historical stock to pull for past
+    months (same limitation as the existing monthly report's stock
+    handling).
     """
     stock_df = safe_read_sql("SELECT * FROM store_product_snapshot")
 
@@ -548,6 +663,18 @@ def aggregate_stock_by_brand_group(stock_df: pd.DataFrame, brand_sub_df: pd.Data
         stock_qty=("quantity", "sum"),
         stock_amt=("totalAmount", "sum"),
     )
+
+
+def aggregate_stock_by_brand(stock_df: pd.DataFrame) -> pd.DataFrame:
+    """Network-wide current-day stock summed per brand only (no barcode
+    breakdown) — used for the Vendor Monthly sheet, where stock gets
+    repeated across every vendor+month row for that brandName (see the
+    module docstring, sheet 4). Returned with a `brandName` column."""
+    agg = stock_df.groupby("brand", as_index=False).agg(
+        stock_qty=("quantity", "sum"),
+        stock_amt=("totalAmount", "sum"),
+    )
+    return agg.rename(columns={"brand": "brandName"})
 
 
 # =============================================================================
@@ -642,6 +769,46 @@ def build_brand_group_sheet(
         "Stock Qty", "Stock Amount (₹)", "Off Invoice Value",
     ]
     return merged
+
+
+def build_vendor_monthly_sheet(
+    vendor_monthly_df: pd.DataFrame,
+    stock_by_brand: pd.DataFrame,
+    brand_sub_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Builds the Vendor Monthly sheet. Merges current-day stock (repeated
+    across every vendor+month row for a given brandName — see the module
+    docstring, sheet 4) and maps brand_group via brand_sub, with the same
+    unmapped-brand fallback (own brandName as group of one) used everywhere
+    else in the pipeline.
+
+    Stock is joined on a whitespace-trimmed brand key: load_stock() trims
+    the stock side's brand, but the SQL result's brandName is untrimmed, so
+    a stray space in grn_data/billing_data would otherwise leave that
+    brand's stock silently at 0."""
+    mapping = brand_sub_df.set_index("sub_brand")["brand_group"]
+
+    df = vendor_monthly_df.copy()
+    df["_brand_key"] = df["brandName"].astype(str).str.strip()
+
+    stock = stock_by_brand.rename(columns={"brandName": "_brand_key"})
+    df = df.merge(stock, on="_brand_key", how="left")
+    df["stock_qty"] = df["stock_qty"].fillna(0)
+    df["stock_amt"] = df["stock_amt"].fillna(0)
+
+    df["brand_group"] = df["brandName"].map(mapping).fillna(df["brandName"])
+
+    df = df[[
+        "brand_group", "brandName", "vendor", "vendorGst", "month",
+        "purchase_qty", "purchase_amount", "sale_qty", "sale_revenue",
+        "stock_qty", "stock_amt", "margin_pct",
+    ]]
+    df.columns = [
+        "Brand(Group)", "Sub Brand", "Vendor", "Vendor GST", "Month",
+        "Purchase Qty", "Purchase Amount (₹)", "Sale Qty", "Sale Revenue (₹)",
+        "Stock Qty", "Stock Amount (₹)", "Margin%",
+    ]
+    return df.sort_values(["Brand(Group)", "Sub Brand", "Month", "Vendor"]).reset_index(drop=True)
 
 
 # =============================================================================
@@ -825,8 +992,8 @@ def _create_report_email_body(start_date: date, end_date_inclusive: date, file_s
             <p>Hi,</p>
 
             <p>The report covering <strong>{start_date:%d %b %Y}</strong> to
-            <strong>{end_date_inclusive:%d %b %Y}</strong> (last 6 complete months) is ready,
-            with Product Wise, Brand Group, and Mondelez Product Wise sheets.</p>
+            <strong>{end_date_inclusive:%d %b %Y}</strong> is ready, with Product Wise,
+            Brand Group, Mondelez Product Wise, and Vendor Monthly sheets.</p>
 
             {delivery_note}
 
@@ -967,10 +1134,10 @@ def _style_sheet(ws, df: pd.DataFrame):
         # then crashes with "object of type 'float' has no len()" the first
         # time it hits one of those leftover NaNs (e.g. an unmatched
         # purchase/sale, a brand_group with no brand_group_meta row, an
-        # all-blank Off Invoice Margin column, etc — all normal, expected
-        # cases in this data). Handling missing values explicitly instead
-        # of relying on astype(str) to do it works the same on every
-        # pandas version.
+        # all-blank Off Invoice Margin column, an unmatched vendor row in
+        # Vendor Monthly, etc — all normal, expected cases in this data).
+        # Handling missing values explicitly instead of relying on
+        # astype(str) to do it works the same on every pandas version.
         max_len = max(
             len(str(col_name)),
             df[col_name].map(lambda v: len(str(v)) if pd.notna(v) else 0).max() if len(df) else 0,
@@ -981,19 +1148,24 @@ def _style_sheet(ws, df: pd.DataFrame):
 
 
 def write_workbook_bytes(
-    product_sheet: pd.DataFrame, brand_group_sheet: pd.DataFrame, mondelez_sheet: pd.DataFrame,
+    product_sheet: pd.DataFrame,
+    brand_group_sheet: pd.DataFrame,
+    mondelez_sheet: pd.DataFrame,
+    vendor_monthly_sheet: pd.DataFrame,
 ) -> bytes:
-    """Builds the three-sheet workbook entirely in memory and returns its
+    """Builds the four-sheet workbook entirely in memory and returns its
     raw bytes — nothing is ever written to local disk."""
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         product_sheet.to_excel(writer, sheet_name="Product Wise", index=False)
         brand_group_sheet.to_excel(writer, sheet_name="Brand Group", index=False)
         mondelez_sheet.to_excel(writer, sheet_name="Mondelez Product Wise", index=False)
+        vendor_monthly_sheet.to_excel(writer, sheet_name="Vendor Monthly", index=False)
 
         _style_sheet(writer.sheets["Product Wise"], product_sheet)
         _style_sheet(writer.sheets["Brand Group"], brand_group_sheet)
         _style_sheet(writer.sheets["Mondelez Product Wise"], mondelez_sheet)
+        _style_sheet(writer.sheets["Vendor Monthly"], vendor_monthly_sheet)
 
     file_bytes = buffer.getvalue()
     log.info(f"Workbook built in memory ({len(file_bytes) / (1024*1024):.1f} MB) — not saved to disk.")
@@ -1006,12 +1178,12 @@ def write_workbook_bytes(
 # =============================================================================
 
 def run_report(start_date: date, end_exclusive: date, end_date_inclusive: date) -> dict:
-    """Runs the full pipeline for the given window: selected brands, both
-    queries, stock download + merge, in-memory workbook build, email
-    delivery. Returns a small status dict — there is no output file path,
-    since the workbook is never saved locally. Raises on any unrecoverable
-    failure — callers (including the Streamlit portal) should catch and
-    surface that."""
+    """Runs the full pipeline for the given window: selected brands, all
+    queries (including Vendor Monthly, which uses the same window and
+    brands), stock load + merge, in-memory workbook build, email delivery.
+    Returns a small status dict — there is no output file path, since the
+    workbook is never saved locally. Raises on any unrecoverable failure —
+    callers (including the Streamlit portal) should catch and surface that."""
     log.info(f"Report window: {start_date.isoformat()} to {end_date_inclusive.isoformat()} (inclusive)")
 
     log.info("Loading selected brand list (brand_portal_selected_brands)...")
@@ -1034,11 +1206,16 @@ def run_report(start_date: date, end_exclusive: date, end_date_inclusive: date) 
     brand_group_df = get_brand_group_summary(start_date, end_exclusive, selected_brands)
     log.info(f"  {len(brand_group_df)} brand-group rows")
 
+    log.info("Running vendor-monthly query (purchase vs sales, FULL OUTER JOIN, same window & brands)...")
+    vendor_monthly_df = get_vendor_monthly(start_date, end_exclusive, selected_brands)
+    log.info(f"  {len(vendor_monthly_df)} vendor-monthly rows")
+
     log.info("Loading current stock snapshot from store_product_snapshot "
              "(populated separately by the daily stock_snapshot_downloader.py cron job)...")
     stock_df = load_stock()
     stock_by_barcode = aggregate_stock_by_barcode(stock_df)
     stock_by_brand_group = aggregate_stock_by_brand_group(stock_df, brand_sub_df)
+    stock_by_brand = aggregate_stock_by_brand(stock_df)
     log.info(f"  Stock loaded: {len(stock_df)} rows -> {stock_by_brand_group['brand_group'].nunique()} brand groups")
 
     log.info("Merging stock into product-level data and building sheets...")
@@ -1046,14 +1223,16 @@ def run_report(start_date: date, end_exclusive: date, end_date_inclusive: date) 
     product_sheet = build_product_wise_sheet(merged_base)
     mondelez_sheet = build_mondelez_product_sheet(merged_base)
     brand_group_sheet = build_brand_group_sheet(brand_group_df, stock_by_brand_group, brand_group_meta_df)
+    vendor_monthly_sheet = build_vendor_monthly_sheet(vendor_monthly_df, stock_by_brand, brand_sub_df)
 
     log.info(
         f"Done. Product Wise: {len(product_sheet)} rows | Brand Group: {len(brand_group_sheet)} rows "
-        f"| Mondelez Product Wise: {len(mondelez_sheet)} rows"
+        f"| Mondelez Product Wise: {len(mondelez_sheet)} rows "
+        f"| Vendor Monthly: {len(vendor_monthly_sheet)} rows"
     )
 
     filename = f"Purchase_Sales_Stock_Report_{start_date:%Y-%m-%d}_to_{end_date_inclusive:%Y-%m-%d}.xlsx"
-    file_bytes = write_workbook_bytes(product_sheet, brand_group_sheet, mondelez_sheet)
+    file_bytes = write_workbook_bytes(product_sheet, brand_group_sheet, mondelez_sheet, vendor_monthly_sheet)
     file_size_mb = len(file_bytes) / (1024 * 1024)
     log.info(f"Report size: {file_size_mb:.1f} MB")
 
@@ -1071,9 +1250,11 @@ def run_report(start_date: date, end_exclusive: date, end_date_inclusive: date) 
             "product_wise": len(product_sheet),
             "brand_group": len(brand_group_sheet),
             "mondelez_product_wise": len(mondelez_sheet),
+            "vendor_monthly": len(vendor_monthly_sheet),
         },
         **delivery_result,
     }
+
 
 # =============================================================================
 # ENTRY POINT
