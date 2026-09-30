@@ -21,14 +21,22 @@ sheets:
                                   Margin (%) come from the brand portal
                                   (brand_group_meta). Off Invoice Value is
                                   blank until the margin is set.
-  3. "Mondelez Product Wise"    — same product-level grain as sheet 1, but
-                                  filtered to brand_group == MONDELEZ_BRAND_GROUP
-                                  and reshaped to the columns: Brand (Group),
-                                  Sub Brand, Product Name, barcode, Purchase
-                                  Qty, Purchase Amount (₹, Ex-GST), Sale Qty,
-                                  Sale Revenue (₹, Ex-GST), Current Stock Qty,
-                                  Current Stock Amt (₹), Gross Margin on
-                                  Sales (%).
+  3. "Mondelez Product Wise"    — same product grain as sheet 1, but broken
+                                  out by MONTH as well, filtered to
+                                  brand_group == MONDELEZ_BRAND_GROUP, and
+                                  reshaped to the columns: Brand (Group),
+                                  Sub Brand, Month, Product Name, barcode,
+                                  Purchase Qty, Purchase Amount (₹, Ex-GST),
+                                  Sale Qty, Sale Revenue (₹, Ex-GST), Current
+                                  Stock Qty, Current Stock Amt (₹), Gross
+                                  Margin on Sales (%).
+                                  ⚠ Current Stock Qty/Amt are a CURRENT-DAY
+                                  snapshot, not a month-end balance, so the
+                                  same stock figure is repeated on every
+                                  month row for a given product — do not sum
+                                  Current Stock down the Month column for a
+                                  multi-month product, or you'll overcount
+                                  (same caveat as sheet 4's Stock column).
   4. "Vendor Monthly"           — purchase vs sales vs stock per (brand_group,
                                   sub_brand, vendor, vendorGst, month),
                                   columns: Brand(Group), Sub Brand, Vendor,
@@ -83,16 +91,20 @@ runs on:
     2026-01-15       -> 2025-07-01 to 2025-12-31  (year boundary handled)
 
 The Streamlit portal can pass any start/end instead; every sheet (including
-Vendor Monthly) uses whatever window run_report() is given. If the window
-starts/ends mid-month, the first/last month on the Vendor Monthly sheet
-only contains the days inside the window.
+Vendor Monthly and Mondelez Product Wise) uses whatever window run_report()
+is given. If the window starts/ends mid-month, the first/last month on the
+Vendor Monthly and Mondelez Product Wise sheets only contains the days
+inside the window.
 
 STOCK HANDLING:
   - Stock is a CURRENT-DAY snapshot only — it has no historical month
     breakdown and no vendor breakdown. There is no way to compute "stock
     as of March" or "stock for Vendor X" from this data.
-  - Product-wise sheets: stock is summed network-wide (across all stores)
+  - Product-wise sheet: stock is summed network-wide (across all stores)
     per (brand, barcode) and merged onto the matching product row.
+  - Mondelez Product Wise sheet: same network-wide stock per (brand,
+    barcode), merged onto every month row for that product — see the
+    caveat under sheet 3 above.
   - Brand-group sheet: stock is summed network-wide per brand_group.
   - Vendor Monthly sheet: stock is summed network-wide per brandName
     (sub_brand) and repeated across every vendor+month row for that
@@ -417,6 +429,83 @@ def get_product_wise(start_date: date, end_exclusive: date, brands: list[str]) -
 
 
 # =============================================================================
+# Query 1b — Product-wise, broken out by MONTH too (used only by the
+# "Mondelez Product Wise" sheet — sheet 1 stays aggregated over the whole
+# window, unaffected by this query)
+# =============================================================================
+# Same purchase/sales logic and columns as PRODUCT_WISE_QUERY, with "month"
+# added to both CTEs' GROUP BY and to the FULL OUTER JOIN key, so a product
+# that sold in more than one month of the window gets one row per month
+# instead of one row for the whole window. Uses the same %(start)s /
+# %(end_exclusive)s / %(brands)s params as every other query here, so it
+# follows the portal's date picker and brand selection exactly like the
+# Vendor Monthly sheet already does.
+
+PRODUCT_WISE_MONTHLY_QUERY = """
+WITH purchase AS (
+    SELECT
+        "brandName",
+        TRIM("barcode") AS "barcode",
+        MAX("productName") AS "productName",
+        TO_CHAR(DATE_TRUNC('month', "Date"), 'YYYY-MM') AS "month",
+        SUM("recievedQuantity") AS purchase_qty,
+        SUM("totalCost") AS purchase_amount
+    FROM grn_data
+    WHERE "brandName" = ANY(%(brands)s)
+      AND "Date" >= %(start)s
+      AND "Date" < %(end_exclusive)s
+    GROUP BY "brandName", TRIM("barcode"), TO_CHAR(DATE_TRUNC('month', "Date"), 'YYYY-MM')
+),
+sales AS (
+    SELECT
+        "brandName",
+        TRIM("barcode") AS "barcode",
+        MAX("productName") AS "productName",
+        TO_CHAR(DATE_TRUNC('month', "orderDate"), 'YYYY-MM') AS "month",
+        SUM("quantity") AS sale_qty,
+        SUM("orderAmountNet") AS sale_revenue
+    FROM billing_data
+    WHERE "brandName" = ANY(%(brands)s)
+      AND "orderDate" >= %(start)s
+      AND "orderDate" < %(end_exclusive)s
+      AND "orderStatus" NOT IN ('CANCELLED', 'CANCELED')
+    GROUP BY "brandName", TRIM("barcode"), TO_CHAR(DATE_TRUNC('month', "orderDate"), 'YYYY-MM')
+)
+SELECT
+    COALESCE(p."brandName", s."brandName") AS "brandName",
+    COALESCE(p."barcode", s."barcode") AS "barcode",
+    COALESCE(p."month", s."month") AS "month",
+    COALESCE(p."productName", s."productName") AS "productName",
+    COALESCE(p.purchase_qty, 0) AS "purchase_qty",
+    ROUND(COALESCE(p.purchase_amount, 0), 2) AS "purchase_amount",
+    COALESCE(s.sale_qty, 0) AS "sale_qty",
+    ROUND(COALESCE(s.sale_revenue, 0), 2) AS "sale_revenue",
+    ROUND(
+        (
+            (s.sale_revenue / NULLIF(s.sale_qty, 0))
+            - (p.purchase_amount / NULLIF(p.purchase_qty, 0))
+        )
+        / NULLIF(s.sale_revenue / NULLIF(s.sale_qty, 0), 0)
+        * 100,
+        2
+    ) AS "profit_margin_pct"
+FROM purchase p
+FULL OUTER JOIN sales s
+    ON p."brandName" = s."brandName"
+   AND p."barcode" = s."barcode"
+   AND p."month" = s."month"
+ORDER BY "brandName", "month", "productName"
+"""
+
+
+def get_product_wise_monthly(start_date: date, end_exclusive: date, brands: list[str]) -> pd.DataFrame:
+    return safe_read_sql(
+        PRODUCT_WISE_MONTHLY_QUERY,
+        params={"start": start_date, "end_exclusive": end_exclusive, "brands": brands},
+    )
+
+
+# =============================================================================
 # Query 2 — Brand Group (via brand_sub mapping, no vendor/month breakdown)
 # =============================================================================
 # Groups purely by brand_group (from the brand_sub table you maintain:
@@ -684,8 +773,8 @@ def aggregate_stock_by_brand(stock_df: pd.DataFrame) -> pd.DataFrame:
 def _merge_product_wise_base(
     product_df: pd.DataFrame, stock_by_barcode: pd.DataFrame, brand_sub_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Shared, un-renamed merge used by BOTH the full "Product Wise" sheet
-    and the "Mondelez Product Wise" sheet, so the two never drift apart."""
+    """Shared, un-renamed merge used by the "Product Wise" sheet (whole-
+    window grain, no month column)."""
     mapping = brand_sub_df.set_index("sub_brand")["brand_group"]
 
     merged = product_df.merge(stock_by_barcode, on=["brandName", "barcode"], how="left")
@@ -695,6 +784,25 @@ def _merge_product_wise_base(
     # Same unmapped-brand fallback as the SQL brand_group queries: a brand
     # with no brand_sub row shows its own brandName as the group, rather
     # than a blank cell.
+    merged["brand_group"] = merged["brandName"].map(mapping).fillna(merged["brandName"])
+
+    return merged
+
+
+def _merge_product_wise_monthly_base(
+    product_monthly_df: pd.DataFrame, stock_by_barcode: pd.DataFrame, brand_sub_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Same idea as _merge_product_wise_base, but for the month-grain data
+    used only by the "Mondelez Product Wise" sheet. Stock is still the
+    single current-day snapshot per (brand, barcode) — it has no per-month
+    figure — so it is merged onto every month row for that product. See the
+    sheet 3 caveat in the module docstring."""
+    mapping = brand_sub_df.set_index("sub_brand")["brand_group"]
+
+    merged = product_monthly_df.merge(stock_by_barcode, on=["brandName", "barcode"], how="left")
+    merged["stock_qty"] = merged["stock_qty"].fillna(0)
+    merged["stock_amt"] = merged["stock_amt"].fillna(0)
+
     merged["brand_group"] = merged["brandName"].map(mapping).fillna(merged["brandName"])
 
     return merged
@@ -713,21 +821,24 @@ def build_product_wise_sheet(merged_base: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_mondelez_product_sheet(
-    merged_base: pd.DataFrame, brand_group_name: str = MONDELEZ_BRAND_GROUP,
+    merged_monthly_base: pd.DataFrame, brand_group_name: str = MONDELEZ_BRAND_GROUP,
 ) -> pd.DataFrame:
-    """Same grain as "Product Wise", filtered to a single brand_group and
-    reshaped to the columns requested for the Mondelez-specific sheet."""
-    mask = merged_base["brand_group"].astype(str).str.strip().str.casefold() == brand_group_name.casefold()
-    df = merged_base.loc[mask, [
-        "brand_group", "brandName", "productName", "barcode", "purchase_qty", "purchase_amount",
+    """Same product grain as "Product Wise" but with one row per (product,
+    month), filtered to a single brand_group and reshaped to the columns
+    requested for the Mondelez-specific sheet. "Month" is 'YYYY-MM', taken
+    straight from the query (dynamic — however many months are in the
+    window, that many month values will appear, no hardcoding)."""
+    mask = merged_monthly_base["brand_group"].astype(str).str.strip().str.casefold() == brand_group_name.casefold()
+    df = merged_monthly_base.loc[mask, [
+        "brand_group", "brandName", "month", "productName", "barcode", "purchase_qty", "purchase_amount",
         "sale_qty", "sale_revenue", "stock_qty", "stock_amt", "profit_margin_pct",
     ]].copy()
     df.columns = [
-        "Brand (Group)", "Sub Brand", "Product Name", "barcode", "Purchase Qty",
+        "Brand (Group)", "Sub Brand", "Month", "Product Name", "barcode", "Purchase Qty",
         "Purchase Amount (₹, Ex-GST)", "Sale Qty", "Sale Revenue (₹, Ex-GST)",
         "Current Stock Qty", "Current Stock Amt (₹)", "Gross Margin on Sales (%)",
     ]
-    return df.sort_values(["Sub Brand", "Product Name"]).reset_index(drop=True)
+    return df.sort_values(["Sub Brand", "Month", "Product Name"]).reset_index(drop=True)
 
 
 def build_brand_group_sheet(
@@ -1179,11 +1290,12 @@ def write_workbook_bytes(
 
 def run_report(start_date: date, end_exclusive: date, end_date_inclusive: date) -> dict:
     """Runs the full pipeline for the given window: selected brands, all
-    queries (including Vendor Monthly, which uses the same window and
-    brands), stock load + merge, in-memory workbook build, email delivery.
-    Returns a small status dict — there is no output file path, since the
-    workbook is never saved locally. Raises on any unrecoverable failure —
-    callers (including the Streamlit portal) should catch and surface that."""
+    queries (including Vendor Monthly and the Mondelez month breakdown,
+    both of which use the same window and brands as everything else),
+    stock load + merge, in-memory workbook build, email delivery. Returns a
+    small status dict — there is no output file path, since the workbook
+    is never saved locally. Raises on any unrecoverable failure — callers
+    (including the Streamlit portal) should catch and surface that."""
     log.info(f"Report window: {start_date.isoformat()} to {end_date_inclusive.isoformat()} (inclusive)")
 
     log.info("Loading selected brand list (brand_portal_selected_brands)...")
@@ -1201,6 +1313,10 @@ def run_report(start_date: date, end_exclusive: date, end_date_inclusive: date) 
     log.info("Running product-wise query (purchase vs sales, FULL OUTER JOIN)...")
     product_df = get_product_wise(start_date, end_exclusive, selected_brands)
     log.info(f"  {len(product_df)} product rows")
+
+    log.info("Running product-wise MONTHLY query (purchase vs sales, FULL OUTER JOIN, for the Mondelez sheet)...")
+    product_monthly_df = get_product_wise_monthly(start_date, end_exclusive, selected_brands)
+    log.info(f"  {len(product_monthly_df)} product-month rows")
 
     log.info("Running brand-group query (purchase vs sales, summed over the whole window)...")
     brand_group_df = get_brand_group_summary(start_date, end_exclusive, selected_brands)
@@ -1220,8 +1336,9 @@ def run_report(start_date: date, end_exclusive: date, end_date_inclusive: date) 
 
     log.info("Merging stock into product-level data and building sheets...")
     merged_base = _merge_product_wise_base(product_df, stock_by_barcode, brand_sub_df)
+    merged_monthly_base = _merge_product_wise_monthly_base(product_monthly_df, stock_by_barcode, brand_sub_df)
     product_sheet = build_product_wise_sheet(merged_base)
-    mondelez_sheet = build_mondelez_product_sheet(merged_base)
+    mondelez_sheet = build_mondelez_product_sheet(merged_monthly_base)
     brand_group_sheet = build_brand_group_sheet(brand_group_df, stock_by_brand_group, brand_group_meta_df)
     vendor_monthly_sheet = build_vendor_monthly_sheet(vendor_monthly_df, stock_by_brand, brand_sub_df)
 
